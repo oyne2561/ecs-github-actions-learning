@@ -1,0 +1,13 @@
+name: API Deploy Pipeline
+on: push
+
+jobs:
+  hello-jobs:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Hello"
+      - run: echo "GitHub Actions!!!!"
+  goodbye-job:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Goodbye, GitHub Actions."
