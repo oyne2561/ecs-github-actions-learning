@@ -1,6 +1,7 @@
 FROM gradle:jdk21 AS build
 WORKDIR /app
 COPY . /app
+# このbuildでテストもしている
 RUN ./gradlew build
 
 

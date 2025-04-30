@@ -1,13 +1,122 @@
 name: API Deploy Pipeline
-on: push
+on:
+  push:
+    paths:
+      # apiフォルダ内とこのyamlファイルに変更があった場合のみcicdを走らせるという条件
+      # YAML ファイルのパス指定はリポジトリのルートディレクトリ基準で解釈される。
+      - '.github/workflows/**'
+      - 'api/**'
+
+# 以下のjobsで使える環境変数を定義
+env:
+  AWS_REGION: ap-northeast-1
+  ECS_CLUSTER: my-app-cluster
+  ECS_SERVICE: my-app-api-service
+  ECR_REPOSITORY: my-app-api
+  ECS_TASK_DEFINITION_API: .aws/task-def-api.json
+
+# Open ID Connectという手法を使って認証を行う際に必要な記述
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  hello-jobs:
+  # Test/Build
+  test-and-build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        # apiディレクトリをワーキングディレクトリに指定
+        working-directory: api
     steps:
-      - run: echo "Hello"
-      - run: echo "GitHub Actions!!!!"
-  goodbye-job:
+      # `actions/checkout@v4`の役割: リポジトリのコードをワークフローの実行環境にダウンロード（チェックアウト）する
+      # usesはgithub actionsのテンプレートを参照する時に使用する。第三者が作った便利なものを使う
+      # https://github.com/marketplace/actions/checkout
+      - uses: actions/checkout@v4
+
+      - name: Run Tests and Build an Image
+        run: docker image build -t temp_api_image:latest .
+
+
+      - name: Configure AWS credentials
+        # https://github.com/marketplace/actions/configure-aws-credentials-action-for-github-actions
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          # 秘匿性の高い情報を扱いたいときはsecretsという別の領域を使う。githubのsettingで定義する。
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push the image to Amazon ECR
+        # このステップだけで有効な環境変数
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        # 仮に命名したTagの名前を書き換える
+        # `github.sha`はコミットのハッシュを取得できる 例: 52c94cds
+        run: |
+          docker image tag temp_api_image:latest $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker image push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          echo $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} > api-image-uri.txt
+
+      # artifactは記憶領域。ジョブ間でのデータ共有手段。今回はimage名を次のJobで使用するために保存する
+      - name: Upload the image uri file as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-image-uri
+          # usesの中ではワーキングディレクトリは効かないので、ルートパスから入れる必要がある。
+          path: api/api-image-uri.txt
+
+  # Deploy
+  deploy:
     runs-on: ubuntu-latest
+    # needsは `test-and-build`のjobが完了していることが必須という意味。deployの前に走る必要がある。needsは複数入れることも可能。
+    needs: [test-and-build]
+
     steps:
-      - run: echo "Goodbye, GitHub Actions."
+      - name: Checkout
+        # `actions/checkout@v4`の役割: リポジトリのコードをワークフローの実行環境にダウンロード（チェックアウト）する
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        # https://github.com/marketplace/actions/configure-aws-credentials-action-for-github-actions
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          # 秘匿性の高い情報を扱いたいときはsecretsという別の領域を使う。githubのsettingで定義する。
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Download the artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: api-image-uri
+          # ここでのpathはダウンロード先のpathになる。api-image-uriの中のデータがartifacts野中にダウンロードされる
+          path: artifacts
+
+      - name: Define the image URI
+        # `$GITHUB_ENV`はGitHub Actionsの特殊なファイルで、このファイルに書き込むことで環境変数を設定できます。
+        # API_IMAGE_URIが以降で使えるようになる。
+        run: |
+          echo "API_IMAGE_URI=$(cat artifacts/api-image-uri.txt)" >> $GITHUB_ENV
+
+      - name: Fill in the new image URI in the amazon ECS task definition
+        # idが設定されたステップの出力は、steps.[id].outputs
+        id: render-task-def
+        # https://github.com/marketplace/actions/amazon-ecs-render-task-definition-action-for-github-actions
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION_API }}
+          container-name: api
+          image: ${{ env.API_IMAGE_URI }}
+
+      - name: Deploy ECS task
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          # サービスが正常に更新されたことを確認してから次のステップに進みます
+          wait-for-service-stability: true
+
