@@ -1,13 +1,62 @@
 name: API Deploy Pipeline
-on: push
+on:
+  push:
+    paths:
+      # apiフォルダ内とこのyamlファイルに変更があった場合のみcicdを走らせるという条件
+      # YAML ファイルのパス指定はリポジトリのルートディレクトリ基準で解釈される
+      - '.github/workflows/**'
+      - 'api/**'
+
+# 以下のjobsで使える環境変数を定義
+env:
+  AWS_REGION: us-west-2
+  ECS_CLUSTER: my-app-cluster
+  ECS_SERVICE: my-app-api-service
+  ECR_REPOSITORY: my-app-api
+  ECS_TASK_DEFINITION_API: .aws/task-def-api.json
+
+# Open ID Connectという手法を使って認証を行う際に必要な記述
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  hello-jobs:
+# Test/Build
+  test-and-build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        # apiディレクトリをワーキングディレクトリに指定
+        working-directory: api
     steps:
-      - run: echo "Hello"
-      - run: echo "GitHub Actions!!!!"
-  goodbye-job:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "Goodbye, GitHub Actions."
+      # Checkout code コードをダウンロードする、コードをワーキングディレクトリに持ってくるみたいなこと
+      # usesはgithub actionsのテンプレートを参照する時に使用する。第三者が作った便利なものを使う
+      # https://github.com/marketplace/actions/checkout
+      - uses: actions/checkout@v4
+
+      - name: Run Tests and Build an Image
+        run: docker image build -t temp_api_image:latest .
+
+
+      - name: Configure AWS credentials
+        # https://github.com/marketplace/actions/configure-aws-credentials-action-for-github-actions
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          # 秘匿性の高い情報を扱いたいときはsecretsという別の領域を使う。githubのsettingで定義する。
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push the image to Amazon ECR
+        # このステップだけで有効な環境変数
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        # 仮に命名したTagの名前を書き換える
+        # `github.sha`はコミットのハッシュを取得できる 例: 52c94cds
+        run: |
+          docker image tag temp_api_image:latest $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker image push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+# Deploy
